@@ -40,6 +40,13 @@ impl TokenizedDoc {
         self.tokens.len()
     }
 
+    /// Positions through the last searchable token, including preserved gaps.
+    pub fn position_len(&self) -> u32 {
+        self.token_positions
+            .last()
+            .map_or(0, |pos| pos.saturating_add(1))
+    }
+
     pub fn tokens(&self) -> &[String] {
         &self.tokens
     }
@@ -204,7 +211,7 @@ fn evaluate_searchable(query: &Query, doc: &TokenizedDoc) -> Result<MatchResult,
             let mut solver = SpanSolver::new(span_query)?;
             let mut intervals = solver.intervals(&positions).collect::<Vec<_>>();
             if let Some(position_filter) = position_filter {
-                let doc_len = doc.len() as u32;
+                let doc_len = doc.position_len();
                 intervals.retain(|interval| position_filter.matches_interval(doc_len, *interval));
             }
             if intervals.is_empty() {
@@ -222,7 +229,7 @@ fn evaluate_searchable(query: &Query, doc: &TokenizedDoc) -> Result<MatchResult,
                 .map(|slot| resolve_slot_positions(slot, doc))
                 .collect::<Vec<_>>();
             let positions = SlotPositions { positions };
-            let resolved = span_expr.resolve(doc.len() as u32);
+            let resolved = span_expr.resolve(doc.position_len());
             let mut solver = SpanSolver::new(&resolved)?;
             let intervals = solver.intervals(&positions).collect::<Vec<_>>();
             if intervals.is_empty() {
@@ -362,7 +369,7 @@ fn collect_highlight_matches(query: &Query, doc: &TokenizedDoc, out: &mut Vec<Hi
             let part = format!("{query}");
             let constrained;
             let root = if let Some(filter) = position_filter {
-                let Some(window) = filter.resolve_window(doc.len() as u32) else {
+                let Some(window) = filter.resolve_window(doc.position_len()) else {
                     return;
                 };
                 constrained = boldi_vigna::SpanQuery::WithinPositions {
@@ -385,7 +392,7 @@ fn collect_highlight_matches(query: &Query, doc: &TokenizedDoc, out: &mut Vec<Hi
                 .map(|slot| resolve_slot_positions(slot, doc))
                 .collect::<Vec<_>>();
             let slot_pos = SlotPositions { positions };
-            let resolved = span_expr.resolve(doc.len() as u32);
+            let resolved = span_expr.resolve(doc.position_len());
             let part = format!("{query}");
             collect_span_marks(&resolved, &resolved, &slot_pos, &part, out);
         }
@@ -685,6 +692,88 @@ mod tests {
 
     fn doc(text: &str) -> TokenizedDoc {
         tokenize_doc(text, default_pipeline())
+    }
+
+    #[test]
+    fn positional_filters_keep_matches_after_normalization_gaps() {
+        for text in [
+            "\u{0369} beer",
+            "alpha \u{0369} beer",
+            "alpha \u{0369} beer \u{0369}",
+        ] {
+            let document = doc(text);
+            for query in [
+                "beer IN FIRST 100%",
+                "beer IN LAST 100%",
+                "beer IN MIDDLE 100%",
+                "beer IN LAST 1 WORDS",
+                "(beer IN LAST 1 WORDS) OR missing",
+            ] {
+                let query = parse_lower(query);
+                assert!(
+                    evaluate(&query, &document).unwrap().matched,
+                    "{text:?}: {query}"
+                );
+                let highlights = evaluate_for_highlight(&query, &document);
+                assert_eq!(highlights.len(), 1, "{text:?}: {query}");
+                assert_eq!(highlights[0].start, document.positions("beer")[0]);
+                assert_eq!(highlights[0].end, document.positions("beer")[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn positional_windows_and_nested_spans_use_position_extent() {
+        let document = TokenizedDoc::new(vec![
+            ("alpha".into(), 0),
+            ("beer".into(), 4),
+            ("wine".into(), 9),
+        ]);
+        assert_eq!(document.len(), 3);
+        for (query, expected) in [
+            ("beer IN FIRST 50%", true),
+            ("wine IN FIRST 50%", false),
+            ("wine IN LAST 10%", true),
+            ("beer IN LAST 10%", false),
+            ("beer IN MIDDLE 20%", true),
+            ("(beer IN FIRST 50%) BEFORE wine", true),
+        ] {
+            let query = parse_lower(query);
+            assert_eq!(
+                evaluate(&query, &document).unwrap().matched,
+                expected,
+                "{query}"
+            );
+            assert_eq!(
+                !evaluate_for_highlight(&query, &document).is_empty(),
+                expected,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn positional_filters_support_collapsed_and_empty_documents() {
+        let mut spec = tokenizer::TokenizerPipelineSpec::tin_default();
+        spec.position_gaps = tokenizer::PositionGapMode::Collapse;
+        let pipeline = spec.compile().unwrap();
+        let document = tokenize_doc("alpha \u{0369} beer", &pipeline);
+        assert_eq!(document.len(), 2);
+        assert_eq!(document.positions("beer"), [1]);
+        for query in [
+            "beer IN LAST 1 WORDS",
+            "beer IN FIRST 100%",
+            "\"alpha beer\"",
+        ] {
+            assert!(evaluate(&parse_lower(query), &document).unwrap().matched);
+        }
+        for text in ["", "\u{0369}"] {
+            assert!(
+                !evaluate(&parse_lower("beer IN LAST 100%"), &doc(text))
+                    .unwrap()
+                    .matched
+            );
+        }
     }
 
     // Highlight part labels are user-facing via $QUERY_PART: expansion

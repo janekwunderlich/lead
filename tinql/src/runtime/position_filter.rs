@@ -35,8 +35,8 @@ impl SpanPositionFilter {
 
     /// Resolve this filter against the given document length.
     ///
-    /// Index-backed callers should pass the immutable sidecar's exact token
-    /// count so filter boundaries match scored search and runtime evaluation.
+    /// Pass the positional extent (last searchable position plus one), including
+    /// preserved gaps, rather than the number of emitted tokens.
     pub fn resolve_window(&self, search_doc_len: u32) -> Option<ResolvedPositionWindow> {
         match *self {
             Self::First(PositionFilterBound::Absolute(count)) => {
