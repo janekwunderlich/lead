@@ -218,7 +218,13 @@ fn highlight_support(request: Internal) -> Internal {
         let rte = pg_sys::list_nth((*parse).rtable, vars.varno - 1).cast::<pg_sys::RangeTblEntry>();
         if rte.is_null()
             || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
-            || crate::score::find_matching_tin_index((*rte).relid, vars.varno, document).is_none()
+            || crate::score::find_matching_tin_index(
+                (*rte).relid,
+                vars.varno,
+                document,
+                (*(*parse).jointree).quals.cast(),
+            )
+            .is_none()
         {
             return unhandled();
         }

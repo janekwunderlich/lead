@@ -1,3 +1,5 @@
+mod multi;
+
 use crate::bm25::{
     Bm25Overrides, DenseRatio, ScoreStopWords, ScoringTermInput, TermScorer, TermSetEdit,
     compile_scoring_terms, sum_scores_in_order,
@@ -214,51 +216,59 @@ fn build_corpus(
     }
 }
 
-fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> {
+fn qualified_relation(heap_oid: pg_sys::Oid) -> String {
     unsafe {
         let relname = pg_sys::get_rel_name(heap_oid);
         let namespace = pg_sys::get_namespace_name(pg_sys::get_rel_namespace(heap_oid));
         if relname.is_null() || namespace.is_null() {
             pgrx::error!("tin score relation no longer exists");
         }
-        let qualified = pg_sys::quote_qualified_identifier(namespace, relname);
-        let index_sql = format!(
-            "SELECT CASE WHEN i.indkey[0] = 0 \
-             THEN pg_catalog.pg_get_expr(i.indexprs, i.indrelid) \
-             ELSE pg_catalog.quote_ident(a.attname) END, \
-             pg_catalog.pg_get_expr(i.indpred, i.indrelid) \
-             FROM pg_catalog.pg_index i \
-             LEFT JOIN pg_catalog.pg_attribute a \
-               ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0] \
-             WHERE i.indexrelid={}::oid AND i.indrelid={}::oid",
-            index_oid.to_u32(),
-            heap_oid.to_u32(),
-        );
-        let (expression, predicate) = Spi::get_two::<String, String>(&index_sql)
-            .unwrap_or_else(|error| pgrx::error!("tin score index lookup failed: {error}"));
-        let expression = expression
-            .unwrap_or_else(|| pgrx::error!("tin score index expression no longer exists"));
-        let predicate = predicate
-            .map(|predicate| format!(" AND ({predicate})"))
-            .unwrap_or_default();
-        let sql = format!(
-            "SELECT ({expression})::text FROM {} WHERE ({expression}) IS NOT NULL{predicate}",
-            CStr::from_ptr(qualified).to_string_lossy(),
-        );
-        Spi::connect(|client| {
-            client
-                .select(&sql, None, &[])
-                .unwrap_or_else(|error| pgrx::error!("tin score corpus scan failed: {error}"))
-                .map(|row| {
-                    row.get::<String>(1)
-                        .unwrap_or_else(|error| {
-                            pgrx::error!("tin score corpus row failed: {error}")
-                        })
-                        .expect("corpus query excludes null documents")
-                })
-                .collect()
-        })
+        CStr::from_ptr(pg_sys::quote_qualified_identifier(namespace, relname))
+            .to_string_lossy()
+            .into_owned()
     }
+}
+
+fn index_definition(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> (String, Option<String>) {
+    let index_sql = format!(
+        "SELECT CASE WHEN i.indkey[0] = 0 \
+         THEN pg_catalog.pg_get_expr(i.indexprs, i.indrelid) \
+         ELSE pg_catalog.quote_ident(a.attname) END, \
+         pg_catalog.pg_get_expr(i.indpred, i.indrelid) \
+         FROM pg_catalog.pg_index i \
+         LEFT JOIN pg_catalog.pg_attribute a \
+           ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0] \
+         WHERE i.indexrelid={}::oid AND i.indrelid={}::oid",
+        index_oid.to_u32(),
+        heap_oid.to_u32(),
+    );
+    let (expression, predicate) = Spi::get_two::<String, String>(&index_sql)
+        .unwrap_or_else(|error| pgrx::error!("tin score index lookup failed: {error}"));
+    let expression =
+        expression.unwrap_or_else(|| pgrx::error!("tin score index expression no longer exists"));
+    (expression, predicate)
+}
+
+fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> {
+    let (expression, predicate) = index_definition(heap_oid, index_oid);
+    let predicate = predicate
+        .map(|predicate| format!(" AND ({predicate})"))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT ({expression})::text FROM {} WHERE ({expression}) IS NOT NULL{predicate}",
+        qualified_relation(heap_oid)
+    );
+    Spi::connect(|client| {
+        client
+            .select(&sql, None, &[])
+            .unwrap_or_else(|error| pgrx::error!("tin score corpus scan failed: {error}"))
+            .map(|row| {
+                row.get::<String>(1)
+                    .unwrap_or_else(|error| pgrx::error!("tin score corpus row failed: {error}"))
+                    .expect("corpus query excludes null documents")
+            })
+            .collect()
+    })
 }
 
 fn tokenize_documents(
@@ -433,7 +443,15 @@ pub(crate) unsafe fn find_matching_tin_index(
     heap_oid: pg_sys::Oid,
     query_varno: i32,
     operand: *mut pg_sys::Node,
+    quals: *mut pg_sys::Node,
 ) -> Option<pg_sys::Oid> {
+    let varnos = unsafe { pg_sys::pull_varnos(std::ptr::null_mut(), operand) };
+    let mut operand_varno = 0;
+    let single_relation = unsafe { pg_sys::bms_get_singleton_member(varnos, &mut operand_varno) };
+    unsafe { pg_sys::bms_free(varnos) };
+    if !single_relation || operand_varno != query_varno {
+        return None;
+    }
     let tin_name = CString::new("tin").expect("static access method name is valid");
     let tin_am = unsafe { pg_sys::get_index_am_oid(tin_name.as_ptr(), false) };
     let normalized = unsafe { pg_sys::copyObjectImpl(operand.cast()).cast::<pg_sys::Node>() };
@@ -446,8 +464,23 @@ pub(crate) unsafe fn find_matching_tin_index(
         let index = unsafe { pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _) };
         let metadata = unsafe { &*(*index).rd_index };
         let is_tin = unsafe { (*(*index).rd_rel).relam } == tin_am;
-        let suitable =
+        let mut suitable =
             is_tin && metadata.indisvalid && metadata.indisready && metadata.indnkeyatts == 1;
+        if suitable {
+            let predicate = unsafe { pg_sys::RelationGetIndexPredicate(index) };
+            if !predicate.is_null() {
+                let predicate =
+                    unsafe { pg_sys::copyObjectImpl(predicate.cast()).cast::<pg_sys::Node>() };
+                unsafe { pg_sys::ChangeVarNodes(predicate, 1, query_varno, 0) };
+                let mut clauses = PgList::<pg_sys::Node>::new();
+                if !quals.is_null() {
+                    clauses.push(quals);
+                }
+                suitable = unsafe {
+                    pg_sys::predicate_implied_by(predicate.cast(), clauses.into_pg(), false)
+                };
+            }
+        }
         let matches = if suitable {
             let key = unsafe { *metadata.indkey.values.as_ptr() };
             if key > 0 {
@@ -506,6 +539,8 @@ unsafe extern "C-unwind" fn has_full_score(node: *mut pg_sys::Node, context: *mu
                 {
                     return true;
                 }
+            } else if multi::is_full_score(function, binding) {
+                return true;
             } else if pg_sys::get_func_support(function.funcid) == binding.support
                 && CStr::from_ptr(pg_sys::get_func_name(function.funcid)).to_bytes()
                     == b"full_score"
@@ -566,9 +601,12 @@ fn score_support(request: Internal) -> Internal {
         if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
             return unhandled();
         }
+        if let Some(replacement) = multi::rewrite(request, ctid, (*rte).relid, &binding.matches) {
+            return Internal::from(Some(pg_sys::Datum::from(replacement as usize)));
+        }
         let Some((document, first_query, index_oid)) =
             binding.matches.iter().find_map(|&(document, query)| {
-                find_matching_tin_index((*rte).relid, ctid.varno, document)
+                find_matching_tin_index((*rte).relid, ctid.varno, document, quals)
                     .map(|index_oid| (document, query, index_oid))
             })
         else {

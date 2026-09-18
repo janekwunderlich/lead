@@ -28,6 +28,8 @@ Lead provides the `tin` access method, the `==>` operator, TINQL parsing, tokeni
 
 Scoring deliberately rescans and retokenizes the visible indexed column or expression. A score call must be in the same query level as the matching `==>` predicate. Implicit highlighting has the same binding boundary; passing its `query` argument explicitly works without a bound predicate.
 
+For searches across multiple indexed columns, `tin.score` and `tin.full_score` sum the contributions from matching fields. NULL and nonmatching fields contribute zero. Each field uses its own index statistics, tokenizer, and scoring options. `tin.max_score` takes the maximum combined score over rows satisfying the indexed search predicates, preserving their AND/OR/NOT structure rather than adding independent per-field maxima.
+
 ## Execution and storage
 
 Each scan reads the table's current block count and adds every block to a lossy bitmap. Postgres owns row visibility, query rechecks, and table maintenance. Index builds evaluate indexed expressions and predicates for validation and statistics; inserts and VACUUM have no index entries to maintain.
