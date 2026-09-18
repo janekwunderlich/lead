@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::{Query, SpanTermSlot, parse_tinql_to_query};
-use tokenizer::Tokenizer;
+use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CacheKey {
@@ -171,15 +171,7 @@ fn build_corpus(
     };
     let terms = compile_scoring_terms(inputs, &edit, stop.as_ref());
     let documents = load_documents(heap_oid, index.oid());
-    let tokenized = documents
-        .iter()
-        .map(|document| {
-            tokenizer
-                .tokenize(document)
-                .map(|token| token.text.into_owned())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    let tokenized = tokenize_documents(&documents, &tokenizer);
     let total_docs = tokenized.len() as u64;
     let average_length = if total_docs == 0 {
         1.0
@@ -264,6 +256,25 @@ fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> 
                 .collect()
         })
     }
+}
+
+fn tokenize_documents(
+    documents: &[String],
+    tokenizer: &CompiledTokenizerPipeline,
+) -> Vec<Vec<String>> {
+    documents
+        .iter()
+        .enumerate()
+        .map(|(row, document)| {
+            if row.is_multiple_of(10) {
+                pgrx::check_for_interrupts!();
+            }
+            tokenizer
+                .tokenize(document)
+                .map(|token| token.text.into_owned())
+                .collect()
+        })
+        .collect()
 }
 
 fn collect_score_terms<'a>(
@@ -372,15 +383,7 @@ fn score_inspect(
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
     let docs = load_documents(heap_oid, index.oid());
-    let tokenized = docs
-        .iter()
-        .map(|doc| {
-            tokenizer
-                .tokenize(doc)
-                .map(|t| t.text.into_owned())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    let tokenized = tokenize_documents(&docs, &tokenizer);
     let n = tokenized.len() as u64;
     let rows = terms
         .into_iter()
