@@ -251,6 +251,81 @@ mod tests {
     }
 
     #[pg_test]
+    fn max_score_excludes_nonmatching_documents() {
+        Spi::run(
+            "CREATE TABLE lite_max_matches (id int, body text);
+             INSERT INTO lite_max_matches VALUES
+               (1, 'beer wine'), (2, 'beer beer beer');
+             CREATE INDEX lite_max_matches_idx ON lite_max_matches USING tin (body);",
+        )
+        .unwrap();
+        for query in ["beer^1 AND wine^0", "beer^1 AND NOT \"beer beer\"^0"] {
+            for scorer in ["tin.score", "tin.full_score"] {
+                let sql = format!(
+                    "SELECT {scorer}(ctid), tin.max_score(ctid)
+                     FROM lite_max_matches WHERE body ==> $query${query}$query$"
+                );
+                let (score, maximum) = Spi::get_two::<f32, f32>(&sql).unwrap();
+                let score = score.unwrap();
+                // Nonmatching documents still contribute to BM25 corpus statistics.
+                assert!(
+                    (score - 0.19856805).abs() < 0.000001,
+                    "{scorer}: {query}: {score}"
+                );
+                assert_eq!(maximum, Some(score), "{scorer}: {query}");
+            }
+        }
+    }
+
+    #[pg_test]
+    fn max_score_respects_phrase_and_position_constraints() {
+        Spi::run(
+            "CREATE TABLE lite_max_positions (id int, body text);
+             INSERT INTO lite_max_positions VALUES
+               (1, 'beer wine' || repeat(' filler', 20)),
+               (2, 'wine wine wine beer beer beer'),
+               (3, U&'beer \\0369 wine beer \\0369 wine');
+             CREATE INDEX lite_max_positions_idx ON lite_max_positions USING tin (body);",
+        )
+        .unwrap();
+        for (query, expected_ids) in [
+            ("\"beer wine\"^1", vec![1]),
+            ("(beer IN FIRST 1 WORDS)^1", vec![1, 3]),
+        ] {
+            for scorer in ["tin.score", "tin.full_score"] {
+                let sql = format!(
+                    "SELECT id, {scorer}(ctid), tin.max_score(ctid)
+                     FROM lite_max_positions WHERE body ==> $query${query}$query$
+                     ORDER BY id"
+                );
+                let rows = Spi::connect(|client| {
+                    client
+                        .select(&sql, None, &[])
+                        .unwrap()
+                        .map(|row| {
+                            (
+                                row.get::<i32>(1).unwrap().unwrap(),
+                                row.get::<f32>(2).unwrap().unwrap(),
+                                row.get::<f32>(3).unwrap().unwrap(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                    expected_ids,
+                    "{scorer}: {query}"
+                );
+                let maximum = rows.iter().map(|row| row.1).fold(0.0_f32, f32::max);
+                assert!(maximum > 0.0, "{scorer}: {query}");
+                for (_, _, reported) in rows {
+                    assert_eq!(reported, maximum, "{scorer}: {query}");
+                }
+            }
+        }
+    }
+
+    #[pg_test]
     fn full_score_normalization_matches_tin() {
         Spi::run(
             "CREATE TABLE lite_normalization (id int, body text);

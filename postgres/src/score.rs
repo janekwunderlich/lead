@@ -10,7 +10,9 @@ use pgrx::{
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_void};
-use tinql::runtime::{Query, SpanTermSlot, parse_tinql_to_query};
+use tinql::runtime::{
+    Query, SpanTermSlot, TokenizedDoc, evaluate, parse_tinql_to_query, tokenize_doc,
+};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,13 +178,13 @@ fn build_corpus(
     let average_length = if total_docs == 0 {
         1.0
     } else {
-        tokenized.iter().map(Vec::len).sum::<usize>() as f32 / total_docs as f32
+        tokenized.iter().map(TokenizedDoc::len).sum::<usize>() as f32 / total_docs as f32
     };
     let mut scorers = Vec::new();
     for term in terms {
         let df = tokenized
             .iter()
-            .filter(|tokens| tokens.iter().any(|token| token == term.text()))
+            .filter(|doc| !doc.positions(term.text()).is_empty())
             .count() as u64;
         let ratio = (!key.full).then_some(dense);
         if !term.is_retained(df, df, total_docs, ratio) {
@@ -197,14 +199,19 @@ fn build_corpus(
     let mut max = 0.0_f32;
     for (document, tokens) in documents.into_iter().zip(tokenized) {
         let score = sum_scores_in_order(scorers.iter().map(|(term, scorer)| {
-            let tf = tokens.iter().filter(|token| *token == term).count() as u32;
+            let tf = tokens.positions(term).len() as u32;
             if tf == 0 {
                 0.0
             } else {
                 scorer.score_count(tf, tokens.len() as u32)
             }
         }));
-        max = max.max(score);
+        if evaluate(&query, &tokens)
+            .unwrap_or_else(|error| pgrx::error!("TIN score query evaluation failed: {error}"))
+            .matched
+        {
+            max = max.max(score);
+        }
         by_document.insert(document, score);
     }
     ScoreCorpus {
@@ -264,7 +271,7 @@ fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> 
 fn tokenize_documents(
     documents: &[String],
     tokenizer: &CompiledTokenizerPipeline,
-) -> Vec<Vec<String>> {
+) -> Vec<TokenizedDoc> {
     documents
         .iter()
         .enumerate()
@@ -272,10 +279,7 @@ fn tokenize_documents(
             if row.is_multiple_of(10) {
                 pgrx::check_for_interrupts!();
             }
-            tokenizer
-                .tokenize(document)
-                .map(|token| token.text.into_owned())
-                .collect()
+            tokenize_doc(document, tokenizer)
         })
         .collect()
 }
@@ -393,7 +397,7 @@ fn score_inspect(
         .filter_map(|term| {
             let df = tokenized
                 .iter()
-                .filter(|doc| doc.iter().any(|t| t == term.text()))
+                .filter(|doc| !doc.positions(term.text()).is_empty())
                 .count() as u64;
             term.is_retained(df, df, n, Some(ratio))
                 .then(|| (term.text().to_owned(), term.boost()))
