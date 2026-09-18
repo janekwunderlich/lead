@@ -103,20 +103,10 @@ unsafe extern "C-unwind" fn collect_queries(node: *mut pg_sys::Node, context: *m
         return false;
     }
     let context = unsafe { &mut *context.cast::<QueryContext>() };
-    if unsafe { (*node).type_ } == pg_sys::NodeTag::T_OpExpr {
-        let op = node.cast::<pg_sys::OpExpr>();
-        let name = unsafe { pg_sys::get_opname((*op).opno) };
-        if !name.is_null()
-            && unsafe { CStr::from_ptr(name) }.to_bytes() == b"==>"
-            && unsafe { pg_sys::list_length((*op).args) } == 2
-        {
-            let left = unsafe { pg_sys::list_nth((*op).args, 0).cast::<pg_sys::Node>() };
-            if unsafe { pg_sys::equal(left.cast(), context.document.cast()) } {
-                context
-                    .queries
-                    .push(unsafe { pg_sys::list_nth((*op).args, 1).cast::<pg_sys::Node>() });
-            }
-        }
+    if let Some((left, right)) = unsafe { crate::operator::search_arguments(node) }
+        && unsafe { pg_sys::equal(left.cast(), context.document.cast()) }
+    {
+        context.queries.push(right);
     }
     unsafe {
         pg_sys::expression_tree_walker(
@@ -218,7 +208,13 @@ fn highlight_support(request: Internal) -> Internal {
         let rte = pg_sys::list_nth((*parse).rtable, vars.varno - 1).cast::<pg_sys::RangeTblEntry>();
         if rte.is_null()
             || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
-            || crate::score::find_matching_tin_index((*rte).relid, vars.varno, document).is_none()
+            || crate::score::find_matching_tin_index(
+                (*rte).relid,
+                vars.varno,
+                document,
+                (*(*parse).jointree).quals.cast(),
+            )
+            .is_none()
         {
             return unhandled();
         }

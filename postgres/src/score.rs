@@ -412,19 +412,8 @@ unsafe extern "C-unwind" fn find_qual(node: *mut pg_sys::Node, context: *mut c_v
         return false;
     }
     let binding = unsafe { &mut *context.cast::<QualBinding>() };
-    if unsafe { (*node).type_ } == pg_sys::NodeTag::T_OpExpr {
-        let op = node.cast::<pg_sys::OpExpr>();
-        let name = unsafe { pg_sys::get_opname((*op).opno) };
-        if !name.is_null()
-            && unsafe { CStr::from_ptr(name) }.to_bytes() == b"==>"
-            && unsafe { pg_sys::list_length((*op).args) } == 2
-        {
-            let left = unsafe { pg_sys::list_nth((*op).args, 0).cast::<pg_sys::Node>() };
-            let right = unsafe { pg_sys::list_nth((*op).args, 1).cast::<pg_sys::Node>() };
-            if !left.is_null() {
-                binding.matches.push((left, right));
-            }
-        }
+    if let Some((left, right)) = unsafe { crate::operator::search_arguments(node) } {
+        binding.matches.push((left, right));
     }
     unsafe { pg_sys::expression_tree_walker(node, Some(find_qual), context) }
 }
@@ -433,6 +422,7 @@ pub(crate) unsafe fn find_matching_tin_index(
     heap_oid: pg_sys::Oid,
     query_varno: i32,
     operand: *mut pg_sys::Node,
+    quals: *mut pg_sys::Node,
 ) -> Option<pg_sys::Oid> {
     let tin_name = CString::new("tin").expect("static access method name is valid");
     let tin_am = unsafe { pg_sys::get_index_am_oid(tin_name.as_ptr(), false) };
@@ -446,8 +436,23 @@ pub(crate) unsafe fn find_matching_tin_index(
         let index = unsafe { pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _) };
         let metadata = unsafe { &*(*index).rd_index };
         let is_tin = unsafe { (*(*index).rd_rel).relam } == tin_am;
-        let suitable =
+        let mut suitable =
             is_tin && metadata.indisvalid && metadata.indisready && metadata.indnkeyatts == 1;
+        if suitable {
+            let predicate = unsafe { pg_sys::RelationGetIndexPredicate(index) };
+            if !predicate.is_null() {
+                let predicate =
+                    unsafe { pg_sys::copyObjectImpl(predicate.cast()).cast::<pg_sys::Node>() };
+                unsafe { pg_sys::ChangeVarNodes(predicate, 1, query_varno, 0) };
+                let mut clauses = PgList::<pg_sys::Node>::new();
+                if !quals.is_null() {
+                    clauses.push(quals);
+                }
+                suitable = unsafe {
+                    pg_sys::predicate_implied_by(predicate.cast(), clauses.into_pg(), false)
+                };
+            }
+        }
         let matches = if suitable {
             let key = unsafe { *metadata.indkey.values.as_ptr() };
             if key > 0 {
@@ -568,7 +573,7 @@ fn score_support(request: Internal) -> Internal {
         }
         let Some((document, first_query, index_oid)) =
             binding.matches.iter().find_map(|&(document, query)| {
-                find_matching_tin_index((*rte).relid, ctid.varno, document)
+                find_matching_tin_index((*rte).relid, ctid.varno, document, quals)
                     .map(|index_oid| (document, query, index_oid))
             })
         else {

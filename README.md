@@ -28,6 +28,8 @@ Lead provides the `tin` access method, the `==>` operator, TINQL parsing, tokeni
 
 Scoring deliberately rescans and retokenizes the visible indexed column or expression. A score call must be in the same query level as the matching `==>` predicate. Implicit highlighting has the same binding boundary; passing its `query` argument explicitly works without a bound predicate.
 
+Search predicates on an indexed column or expression use that index's tokenizer options, including `case_folding=preserve`, for both documents and queries. This applies to sequential scans as well as bitmap scans. Partial indexes are eligible only when the query implies their predicate. Standalone text comparisons use the default tokenizer. When several eligible indexes cover the same expression, Lead binds to the first index in PostgreSQL's index list; use consistent tokenizer options for those indexes.
+
 ## Execution and storage
 
 Each scan reads the table's current block count and adds every block to a lossy bitmap. Postgres owns row visibility, query rechecks, and table maintenance. Index builds evaluate indexed expressions and predicates for validation and statistics; inserts and VACUUM have no index entries to maintain.

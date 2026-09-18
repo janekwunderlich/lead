@@ -66,6 +66,126 @@ mod tests {
     }
 
     #[pg_test]
+    fn matching_uses_index_tokenizer_for_bitmap_and_sequential_scans() {
+        Spi::run(
+            "CREATE TABLE lite_case (id int, body text);
+             INSERT INTO lite_case VALUES (1, 'BEER'), (2, 'beer'), (3, 'Beer'), (4, NULL);
+             CREATE INDEX lite_case_idx ON lite_case USING tin (body) WITH (case_folding=preserve);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        for bitmap in [true, false] {
+            if !bitmap {
+                Spi::run("SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = off;")
+                    .unwrap();
+            }
+            let plan = Spi::get_one::<Json>(
+                "EXPLAIN (FORMAT JSON) SELECT id FROM lite_case WHERE body ==> 'beer'",
+            )
+            .unwrap()
+            .unwrap()
+            .0;
+            assert_eq!(
+                plan[0]["Plan"]["Node Type"],
+                if bitmap {
+                    "Bitmap Heap Scan"
+                } else {
+                    "Seq Scan"
+                }
+            );
+            assert_eq!(
+                Spi::get_one::<Vec<i32>>(
+                    "SELECT array_agg(id ORDER BY id) FROM lite_case WHERE body ==> 'beer'"
+                )
+                .unwrap(),
+                Some(vec![2])
+            );
+            assert!(
+                Spi::get_one::<f32>(
+                    "SELECT tin.full_score(ctid) FROM lite_case WHERE body ==> 'BEER'"
+                )
+                .unwrap()
+                .unwrap()
+                    > 0.0
+            );
+            assert_eq!(
+                Spi::get_one::<String>(
+                    "SELECT tin.highlight(body) FROM lite_case WHERE body ==> 'BEER'"
+                )
+                .unwrap(),
+                Some("<b>BEER</b>".into())
+            );
+        }
+        Spi::run(
+            "SET LOCAL plan_cache_mode = force_generic_plan;
+             PREPARE lite_case_query(text) AS
+               SELECT array_agg(id ORDER BY id) FROM lite_case WHERE body ==> $1;",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>("EXECUTE lite_case_query('BEER')").unwrap(),
+            Some(vec![1])
+        );
+        Spi::run("ALTER INDEX lite_case_idx SET (case_folding=fold)").unwrap();
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>("EXECUTE lite_case_query('BEER')").unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        Spi::run("DEALLOCATE lite_case_query").unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT 'BEER' ==> 'beer'").unwrap(),
+            Some(true)
+        );
+    }
+
+    #[pg_test]
+    fn matching_binds_expression_indexes_and_separate_join_tokenizers() {
+        Spi::run(
+            "CREATE TABLE lite_case_expr (id int, body text, active boolean);
+             INSERT INTO lite_case_expr VALUES (1, 'BEER', true), (2, 'beer', true), (3, 'BEER', false);
+             CREATE INDEX lite_case_expr_idx ON lite_case_expr USING tin (lower(body))
+               WITH (case_folding=preserve) WHERE active;
+             CREATE TABLE lite_case_other (body text);
+             INSERT INTO lite_case_other VALUES ('BEER');
+             CREATE INDEX lite_case_other_idx ON lite_case_other USING tin (body);"
+        ).unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT count(*) FROM lite_case_expr e JOIN lite_case_other o ON true
+             WHERE e.active AND lower(e.body) ==> 'BEER' AND o.body ==> 'beer'"
+            )
+            .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT count(*) FROM lite_case_expr e JOIN lite_case_other o ON true
+             WHERE e.active AND lower(e.body) ==> 'beer' AND o.body ==> 'beer'"
+            )
+            .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[pg_test]
+    fn matching_ignores_inapplicable_partial_indexes() {
+        Spi::run(
+            "CREATE TABLE lite_case_partial (id int, body text, active boolean);
+             INSERT INTO lite_case_partial VALUES (1, 'BEER', true), (2, 'beer', true), (3, 'BEER', false);
+             CREATE INDEX lite_case_partial_idx ON lite_case_partial USING tin (body)
+               WITH (case_folding=preserve) WHERE active;
+             CREATE INDEX lite_case_all_idx ON lite_case_partial USING tin (body);"
+        ).unwrap();
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM lite_case_partial WHERE body ==> 'beer'"
+            )
+            .unwrap(),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[pg_test]
     fn bitmap_scan_follows_heap_growth_and_truncate() {
         Spi::run(
             "CREATE TABLE lite_growth (id int, body text);
